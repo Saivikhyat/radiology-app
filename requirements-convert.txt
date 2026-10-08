@@ -1,0 +1,8 @@
+# One-time dependencies for converting the HF PEFT LoRA to GGUF format.
+# Requires Python 3.12 (torch 2.2.2 is the last version with Intel-Mac wheels).
+# Not needed at app runtime - see scripts/setup_local.sh.
+torch==2.2.2
+transformers
+gguf
+safetensors
+numpy<2

@@ -2,14 +2,24 @@ import base64
 import io
 import json
 import os
+import re
 
 import requests
 import streamlit as st
 from PIL import Image
 
-MODEL_ID = "SaiVikhyat/qwen3-radiology-lora"
+import local_llama
+
+# The requested LoRA (SaiVikhyat/qwen3-radiology-lora) has no Inference Provider
+# deployment, so we call its base model over the API by default. Override with
+# HF_MODEL_ID if you deploy the adapter yourself (e.g. an Inference Endpoint).
+MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen3-VL-4B-Instruct")
+TARGET_LORA = "SaiVikhyat/qwen3-radiology-lora"
+
 CHAT_API_URL = "https://router.huggingface.co/v1/chat/completions"
-INFERENCE_API_URL = "https://api-inference.huggingface.co/models/{model_id}"
+PROVIDER_API_URL = "https://router.huggingface.co/{provider}/v1/chat/completions"
+DEFAULT_PROVIDER = "featherless-ai"
+CREDITS_URL = "https://huggingface.co/settings/inference-providers/billing"
 MAX_IMAGE_SIDE = 1024
 
 REPORT_KEYS = ("examination", "technique", "findings", "impression", "recommendations")
@@ -17,14 +27,47 @@ REPORT_KEYS = ("examination", "technique", "findings", "impression", "recommenda
 PROMPT_TEMPLATE = """You are an expert radiologist. Analyze the attached medical scan \
 (X-ray, CT, or MRI) and produce a structured radiology report.
 
+Write every field in clear, simple language that a non-medical person can easily \
+understand (about an 8th-grade reading level): short sentences and everyday words. \
+If a medical term is needed, add a brief plain-language explanation in parentheses \
+right after it.
+
+Rules:
+- Be thorough and descriptive: 4 to 8 short sentences per field. Walk through
+  everything visible on the scan (for example lungs, heart, bones, diaphragm,
+  soft tissue) and describe how each part looks.
+- Mention each finding exactly once — never repeat or restate a point.
+- Do not leave out anything important, and do not soften or change any finding.
+
 Respond ONLY with a JSON object using exactly these keys:
 {{
   "examination": "type of study, e.g. Chest X-ray PA",
-  "technique": "how the image was acquired/evaluated",
-  "findings": "detailed observations of visible anatomy and abnormalities",
-  "impression": "concise diagnostic summary and clinical impression",
-  "recommendations": "follow-up recommendations, or 'None'"
+  "technique": "how the image was acquired/evaluated, in simple words",
+  "findings": "everything visible on the scan, in simple words",
+  "impression": "plain-language summary of what the scan shows",
+  "recommendations": "next steps in plain words, or 'None'"
 }}"""
+
+
+class HF_APIError(RuntimeError):
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(self._friendly(status, body))
+
+    @staticmethod
+    def _friendly(status: int, body: str) -> str:
+        snippet = body[:300]
+        if status == 402:
+            return (
+                "Your Hugging Face account has no Inference Providers credits. "
+                f"Add pre-paid credits ({CREDITS_URL}) or subscribe to PRO, then retry."
+            )
+        if status == 404:
+            return f"Model not found or not served: {snippet}"
+        if status == 401 or status == 403:
+            return f"Authentication failed — check HF_TOKEN. {snippet}"
+        return f"HF API error {status}: {snippet}"
 
 
 def get_token() -> str:
@@ -63,64 +106,39 @@ def build_messages(prompt: str, image_b64: str, mime: str) -> list:
     ]
 
 
-def call_chat_api(token: str, messages: list, timeout: int = 120) -> str:
+def _post_chat(url: str, token: str, messages: list, timeout: int = 180) -> str:
     response = requests.post(
-        CHAT_API_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        url,
+        headers={"Authorization": f"Bearer {token}"},
         json={
             "model": MODEL_ID,
             "messages": messages,
-            "max_tokens": 1024,
+            "max_tokens": 1600,
             "temperature": 0.2,
             "stream": False,
         },
         timeout=timeout,
     )
     if response.status_code != 200:
-        raise RuntimeError(f"Chat API error {response.status_code}: {response.text[:500]}")
-    return response.json()["choices"][0]["message"]["content"]
-
-
-def call_inference_api(token: str, image_bytes: bytes, timeout: int = 120) -> str:
-    """Fallback: classic text-generation Inference API with the image attached."""
-    url = INFERENCE_API_URL.format(model_id=MODEL_ID)
-    response = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params={
-            "parameters": json.dumps(
-                {
-                    "max_new_tokens": 1024,
-                    "temperature": 0.2,
-                    "return_full_text": False,
-                    "prompt": PROMPT_TEMPLATE,
-                }
-            )
-        },
-        data=image_bytes,
-        timeout=timeout,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"Inference API error {response.status_code}: {response.text[:500]}")
-    return response.text
+        raise HF_APIError(response.status_code, response.text)
+    payload = response.json()
+    try:
+        return payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as exc:
+        raise HF_APIError(502, json.dumps(payload)[:500]) from exc
 
 
 def run_generation(token: str, uploaded_file) -> str:
     _, mime, image_b64 = prepare_image(uploaded_file)
+    messages = build_messages(PROMPT_TEMPLATE, image_b64, mime)
+
     try:
-        return call_chat_api(token, build_messages(PROMPT_TEMPLATE, image_b64, mime))
-    except Exception as chat_error:
-        uploaded_file.seek(0)
-        image_bytes, _, _ = prepare_image(uploaded_file)
-        try:
-            return call_inference_api(token, image_bytes)
-        except Exception as inference_error:
-            raise RuntimeError(
-                f"Vision request failed ({chat_error}); fallback failed too ({inference_error})"
-            )
+        return _post_chat(CHAT_API_URL, token, messages)
+    except HF_APIError as exc:
+        if exc.status == 402:
+            raise  # no credits: retrying other routes is pointless
+        # Aggregate router may not route this model — hit the provider directly.
+        return _post_chat(PROVIDER_API_URL.format(provider=DEFAULT_PROVIDER), token, messages)
 
 
 def parse_report(text: str) -> dict | None:
@@ -137,7 +155,9 @@ def parse_report(text: str) -> dict | None:
     try:
         data = json.loads(cleaned[start : end + 1])
     except json.JSONDecodeError:
-        return None
+        # Salvage fields from a truncated response
+        found = dict(re.findall(r'"(\w+)"\s*:\s*"([^"]*)"', cleaned))
+        data = {k: found[k] for k in REPORT_KEYS if k in found} or None
     return data if isinstance(data, dict) else None
 
 
@@ -157,17 +177,51 @@ def render_report(data: dict, raw: str) -> None:
         st.text(raw)
 
 
+def run_local_generation(uploaded_file) -> str:
+    _, mime, image_b64 = prepare_image(uploaded_file)
+    messages = build_messages(PROMPT_TEMPLATE, image_b64, mime)
+    return local_llama.generate(messages)
+
+
 def main() -> None:
     st.set_page_config(page_title="Radiology Report Generator", page_icon="🩻")
     st.title("🩻 Radiology Report Generator")
-    st.caption(f"Model: `{MODEL_ID}` (Hugging Face Inference API)")
+
+    mode = st.sidebar.radio(
+        "Inference mode",
+        ["Local — free (llama.cpp)", "HF API — paid (Inference Providers)"],
+        index=0,
+        help="Local runs Qwen3-VL-4B + the radiology LoRA on this machine at no cost. "
+        "The HF API uses your account credits.",
+    )
+    local_mode = mode.startswith("Local")
+
+    if local_mode:
+        st.caption(f"Local llama.cpp · Qwen3-VL-4B-Instruct Q4_K_M + `{TARGET_LORA}` LoRA")
+        missing = local_llama.missing_models()
+        if missing:
+            st.error(
+                "Model files missing:\n\n" + "\n".join(f"- `{p}`" for p in missing)
+                + "\n\nRun the download commands from the README, then reload."
+            )
+    else:
+        st.caption(f"Serving `{MODEL_ID}` via Hugging Face Inference Providers")
+
+    with st.expander("About the model"):
+        st.markdown(
+            f"- Model: `{TARGET_LORA}` (LoRA on Qwen3-VL-4B-Instruct).\n"
+            "- **Local mode** converts the adapter to GGUF and runs it with llama.cpp "
+            "on this machine — no API, no credits, no token.\n"
+            f"- **HF API mode** serves the base model `{MODEL_ID}` instead (the LoRA has "
+            "no Inference Provider deployment) and requires credits."
+        )
     st.warning(
         "Educational/demo tool only. Not for clinical use — always have a "
         "qualified radiologist review any finding."
     )
 
     token = get_token()
-    if not token:
+    if not local_mode and not token:
         st.error("HF_TOKEN is not set. Export it before launching: `export HF_TOKEN=hf_...`")
         st.stop()
 
@@ -179,9 +233,16 @@ def main() -> None:
         st.image(Image.open(uploaded_file), caption=uploaded_file.name, use_container_width=True)
 
     if st.button("Generate Report", type="primary", disabled=uploaded_file is None):
-        with st.spinner("Analyzing scan and generating findings..."):
+        spinner = "Starting local model (first run loads ~2.5 GB)..." if local_mode else "Analyzing scan and generating findings..."
+        with st.spinner(spinner):
             try:
-                raw = run_generation(token, uploaded_file)
+                if local_mode:
+                    raw = run_local_generation(uploaded_file)
+                else:
+                    raw = run_generation(token, uploaded_file)
+            except (HF_APIError, local_llama.LocalModelError) as exc:
+                st.error(str(exc))
+                st.stop()
             except Exception as exc:
                 st.error(f"Report generation failed: {exc}")
                 st.stop()

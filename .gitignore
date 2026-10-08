@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+.llama-bin/
+models/
+third_party/
